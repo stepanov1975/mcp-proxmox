@@ -18,7 +18,7 @@ Based on the original Python implementation by [canvrno/ProxmoxMCP](https://gith
 - Terraform/OpenTofu export: generate HCL (with `import` blocks) from existing VMs and containers to adopt them into IaC without recreation
 - Structured output: tools return machine-readable `structuredContent` alongside the Markdown text, so agents can chain on the data
 - MCP Resources (`proxmox://nodes`, `proxmox://vms`, `proxmox://storage`) and Prompts (provisioning, health check, permission diagnosis)
-- Safety rails: optional TLS verification, node/VMID allowlists, and a protection-flag check that blocks deleting protected guests
+- Safety rails: TLS verification by default, node/VMID allowlists, and a protection-flag check that blocks deleting protected guests
 - Built on the official MCP SDK
 
 ## Installation
@@ -35,10 +35,10 @@ Clone and install:
 ```bash
 git clone https://github.com/gilby125/mcp-proxmox.git
 cd mcp-proxmox
-npm install
+npm ci
 ```
 
-Or run without cloning via `npx`:
+The hardened settings described here apply to this checkout. A published `npx` package may lag behind; use the checked-out `index.js` or build the Docker image for these guarantees. For a published version you have independently verified:
 
 ```bash
 PROXMOX_HOST=your-proxmox-ip PROXMOX_TOKEN_VALUE=your-token-secret npx mcp-proxmox
@@ -66,7 +66,8 @@ The server is configured entirely through environment variables:
 | `PROXMOX_TOKEN_NAME` | no | `mcpserver` | API token ID |
 | `PROXMOX_PORT` | no | `8006` | Proxmox API port |
 | `PROXMOX_ALLOW_ELEVATED` | no | `false` | Set `true` to enable write/destructive tools |
-| `PROXMOX_VERIFY_TLS` | no | `false` | Set `true` to verify the Proxmox TLS certificate (use with a CA-signed cert) |
+| `PROXMOX_VERIFY_TLS` | no | `true` | Verify certificate and hostname; only exact `false` opts out (insecure) |
+| `NODE_EXTRA_CA_CERTS` | no | — | Absolute path to a trusted CA PEM file; read by Node at startup |
 | `PROXMOX_NODE_ALLOWLIST` | no | — | Comma-separated node names the server may touch; empty means no restriction |
 | `PROXMOX_VMID_ALLOWLIST` | no | — | Comma-separated VMIDs the server may touch; empty means no restriction |
 
@@ -96,25 +97,15 @@ For Claude Desktop, edit the config file (macOS: `~/Library/Application Support/
 
 Restart the client after editing, then test by asking: "List my Proxmox VMs".
 
-### Option 2: .env file in the parent directory of the installation
+### Option 2: explicitly supply environment variables at launch
 
-The server loads `.env` from `../.env` relative to `index.js` — i.e. the directory above the cloned repo (kept outside the repo so the secret cannot be committed):
+Use your process manager's environment configuration or Docker `--env-file /absolute/path/to/proxmox.env`. The server does **not** search for or load `.env` files, including `../.env`, and does not override the launch environment. Keep credential files outside source control and readable only by the service account. Never paste real tokens into prompts or logs.
 
-```
-/home/user/
-├── .env             <- environment file goes here
-└── mcp-proxmox/
-    └── index.js     <- loads ../.env from here
-```
+### TLS trust
 
-```bash
-# /home/user/.env
-PROXMOX_HOST=your-proxmox-ip-or-hostname
-PROXMOX_USER=root@pam
-PROXMOX_TOKEN_NAME=mcp-server
-PROXMOX_TOKEN_VALUE=your-token-secret
-PROXMOX_ALLOW_ELEVATED=false
-```
+Certificate and hostname verification are enabled by default. For Proxmox's private CA, set `NODE_EXTRA_CA_CERTS=/absolute/path/to/proxmox-ca.pem` in the **launch environment** before Node starts. This extends Node's normal trusted CA store. In Docker, mount the PEM file read-only and set the variable to its container path. Use a hostname/IP covered by the certificate's subject alternative names.
+
+Only the exact setting `PROXMOX_VERIFY_TLS=false` disables verification. This is an insecure compatibility opt-out: a network attacker could capture your API token or forge cluster responses. Prefer installing the CA; do not set `NODE_TLS_REJECT_UNAUTHORIZED=0`.
 
 ### Proxmox API Token Setup
 
@@ -131,6 +122,14 @@ Basic mode (`PROXMOX_ALLOW_ELEVATED=false`, the default) allows only read operat
 
 Elevated mode (`PROXMOX_ALLOW_ELEVATED=true`) additionally enables the write tools that can create, modify, and permanently delete VMs, containers, snapshots, backups, disks, and network interfaces, and execute commands inside guests. Only enable it if you understand and accept those risks.
 
+### Security boundaries and caveats
+
+- Basic mode advertises only read tools and rejects direct calls to all other tools with MCP `isError: true`. The HTTP boundary also rejects non-GET requests. Elevated mode preserves management and guest command execution; treat access to that MCP process as privileged access to Proxmox.
+- This switch does not grant Proxmox privileges. Read calls still require suitable API ACLs (for example `Sys.Audit` for node status, `VM.Audit` for guest configuration). API denials are reported as errors, not successful empty data. Use a dedicated least-privilege user and privilege-separated API token; do not rely on the application switch as the only protection.
+- Node/VMID allowlists validate targeted operations, not complete tenant isolation: cluster listings, resources and exports can expose other objects visible to the token. Enforce visibility with Proxmox ACLs.
+- API-token values and recognizable `PVEAPIToken=...` credentials are redacted from API diagnostics and MCP responses. This is focused credential protection, **not** a general data-loss-prevention filter: guest configuration, cloud-init settings, command output and exports may contain other secrets. Only connect trusted clients and handle returned data as sensitive.
+- MCP uses stdio, not a network listener. A client capable of launching the process controls its environment; enabling elevated mode must be an operator decision, not a tool argument.
+
 ## Available Tools
 
 ### Read-only (always available)
@@ -138,7 +137,7 @@ Elevated mode (`PROXMOX_ALLOW_ELEVATED=true`) additionally enables the write too
 | Tool | Description |
 |---|---|
 | `proxmox_get_nodes` | List cluster nodes with status and resources |
-| `proxmox_get_node_status` | Detailed node status (needs elevated + `Sys.Audit`) |
+| `proxmox_get_node_status` | Detailed node status (requires Proxmox `Sys.Audit`, not elevated mode) |
 | `proxmox_get_vms` | List VMs/containers, filterable by node and type |
 | `proxmox_get_vm_status` | Detailed status for one VM/container |
 | `proxmox_get_storage` | List storage pools and usage |
@@ -153,6 +152,9 @@ Elevated mode (`PROXMOX_ALLOW_ELEVATED=true`) additionally enables the write too
 | `proxmox_get_ha_resources` | High-availability resources and desired state |
 | `proxmox_get_firewall_rules` | Firewall rules at cluster / node / guest level |
 | `proxmox_generate_terraform` | Generate Terraform/OpenTofu HCL from existing guests |
+| `proxmox_list_snapshots_vm`, `proxmox_list_snapshots_lxc` | List guest snapshots |
+| `proxmox_list_backups` | List backup archives |
+| `proxmox_get_guest_ips` | Read guest-agent network interfaces (requires appropriate Proxmox privileges) |
 
 ### Elevated (require `PROXMOX_ALLOW_ELEVATED=true`)
 
@@ -161,13 +163,13 @@ Elevated mode (`PROXMOX_ALLOW_ELEVATED=true`) additionally enables the write too
 | Create | `proxmox_create_vm`, `proxmox_create_lxc` |
 | Lifecycle | `proxmox_start_*`, `proxmox_stop_*`, `proxmox_reboot_*`, `proxmox_shutdown_*`, `proxmox_pause_vm`, `proxmox_resume_vm` |
 | Clone / resize / delete | `proxmox_clone_*`, `proxmox_resize_*`, `proxmox_delete_*` |
-| Snapshots | `proxmox_create_snapshot_*`, `proxmox_list_snapshots_*`, `proxmox_rollback_snapshot_*`, `proxmox_delete_snapshot_*` |
-| Backups | `proxmox_create_backup_*`, `proxmox_list_backups`, `proxmox_restore_backup_*`, `proxmox_delete_backup` |
+| Snapshots | `proxmox_create_snapshot_*`, `proxmox_rollback_snapshot_*`, `proxmox_delete_snapshot_*` |
+| Backups | `proxmox_create_backup_*`, `proxmox_restore_backup_*`, `proxmox_delete_backup` |
 | Disks | `proxmox_add_disk_vm`, `proxmox_add_mountpoint_lxc`, `proxmox_resize_disk_*`, `proxmox_remove_disk_vm`, `proxmox_remove_mountpoint_lxc`, `proxmox_move_disk_*` |
 | Network | `proxmox_add_network_*`, `proxmox_update_network_*`, `proxmox_remove_network_*` |
 | Migrate / template | `proxmox_migrate_vm`, `proxmox_convert_to_template` |
 | Cloud-init | `proxmox_set_cloudinit` (QEMU) |
-| Guest exec / IPs | `proxmox_execute_vm_command`, `proxmox_get_guest_ips` (QEMU via guest agent) |
+| Guest exec | `proxmox_execute_vm_command` (QEMU via guest agent) |
 
 Tools with a `_*` suffix exist in `_vm` (QEMU) and `_lxc` (container) variants.
 
@@ -221,10 +223,10 @@ See [TEST-WORKFLOWS.md](./TEST-WORKFLOWS.md) for workflow test details.
 ## Development
 
 ```bash
-npm install
+npm ci
 npm start        # run the server
 npm run dev      # run with auto-reload
-npm test         # unit tests
+npm test         # offline unit + stdio/TLS integration tests (requires openssl)
 
 # Poke the server directly over stdio
 echo '{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}' | node index.js
