@@ -945,7 +945,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_snapshots_lxc',
-          description: 'List all snapshots of an LXC container (requires elevated permissions)',
+          description: 'List all snapshots of an LXC container (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -957,7 +957,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_snapshots_vm',
-          description: 'List all snapshots of a QEMU virtual machine (requires elevated permissions)',
+          description: 'List all snapshots of a QEMU virtual machine (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1051,7 +1051,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_backups',
-          description: 'List all backups on a storage (requires elevated permissions)',
+          description: 'List all backups on a storage (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1380,7 +1380,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_get_guest_ips',
-          description: "Discover a running VM's real IP addresses via the QEMU guest agent (qemu only; requires elevated permissions and a running guest agent)",
+          description: "Discover a running VM's real IP addresses via the QEMU guest agent (read-only; qemu only; requires appropriate Proxmox API privileges and a running guest agent)",
           inputSchema: {
             type: 'object',
             properties: {

@@ -76,6 +76,21 @@ test('discovery is exactly read-only; every hidden tool rejects direct MCP calls
   assert.equal((await client.callTool({ name: 'proxmox_future_mutation' })).isError, true);
 });
 
+test('read-only tool descriptions do not require elevated mode', async t => {
+  const server = makeServer();
+  const client = await connect(t, server);
+  for (const elevated of [false, true]) {
+    server.allowElevated = elevated;
+    const tools = (await client.listTools()).tools;
+    for (const name of ['proxmox_list_snapshots_vm', 'proxmox_list_snapshots_lxc', 'proxmox_list_backups', 'proxmox_get_guest_ips']) {
+      const tool = tools.find(tool => tool.name === name);
+      assert.ok(tool, name);
+      assert.doesNotMatch(tool.description, /elevated/i, name);
+      assert.match(tool.description, /read-only/i, name);
+    }
+  }
+});
+
 test('every advertised read tool works against GET-only offline responses', async t => {
   const server = makeServer();
   const client = await connect(t, server);

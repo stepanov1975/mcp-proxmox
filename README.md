@@ -236,12 +236,12 @@ Continuous integration runs `npm test` on Node 20 and 22 via GitHub Actions (`.g
 
 ## Known Limitations
 
-- TLS verification defaults to off so the server works with Proxmox's self-signed certificate out of the box. Set `PROXMOX_VERIFY_TLS=true` when you have a CA-signed certificate. Do not point the server at untrusted networks with verification disabled.
+- TLS verification is enabled by default. Proxmox certificates from a private CA require explicit trust via `NODE_EXTRA_CA_CERTS` in the launch environment and a matching hostname/IP; see [TLS trust](#tls-trust). Only `PROXMOX_VERIFY_TLS=false` disables verification, as an insecure compatibility opt-out.
 - `proxmox_execute_vm_command`, `proxmox_get_guest_ips`, and `proxmox_set_cloudinit` work for QEMU VMs only. The Proxmox HTTP API has no exec/agent endpoint for LXC containers, so command execution returns a clear "not supported" message for `type: lxc` — use SSH or `pct exec` on the host instead.
 
 ## Troubleshooting
 
-- "Could not load .env file" warning — harmless if you pass variables via the MCP client `env` block; otherwise put `.env` in the parent directory of the repo (`ls ../.env` from inside `mcp-proxmox`).
+- Missing environment variables — supply them explicitly via the MCP client `env` block, your process manager, or Docker `--env-file /absolute/path/to/proxmox.env`. The server does not load `.env` or `../.env` and does not emit a dotenv-loading warning.
 - Connection refused / timeout — check `PROXMOX_HOST`, `PROXMOX_PORT` (default 8006), and firewall rules.
 - 401 Unauthorized — check `PROXMOX_USER` format (`root@pam`), `PROXMOX_TOKEN_NAME`, and that the secret in `PROXMOX_TOKEN_VALUE` is complete.
 - "Requires Elevated Permissions" — set `PROXMOX_ALLOW_ELEVATED=true` and grant the token the roles listed above.
