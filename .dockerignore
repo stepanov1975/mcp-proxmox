@@ -1,0 +1,7 @@
+# Only the runtime inputs belong in the build context (never .env or local data).
+**
+!Dockerfile
+!.dockerignore
+!package.json
+!package-lock.json
+!index.js

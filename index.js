@@ -13,33 +13,18 @@ import {
 import fetch from 'node-fetch';
 import https from 'https';
 import crypto from 'crypto';
-import { readFileSync } from 'fs';
-import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-// Load environment variables from .env file
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const envPath = join(__dirname, '../.env');
-
-try {
-  const envFile = readFileSync(envPath, 'utf8');
-  const envVars = envFile.split('\n').filter(line => line.includes('=') && !line.trim().startsWith('#'));
-  for (const line of envVars) {
-    const [key, ...values] = line.split('=');
-    // Validate key is a valid environment variable name (alphanumeric and underscore only)
-    if (key && values.length > 0 && /^[A-Z_][A-Z0-9_]*$/.test(key.trim())) {
-      // Remove surrounding quotes if present and trim
-      let value = values.join('=').trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-      process.env[key.trim()] = value;
-    }
-  }
-} catch (error) {
-  console.error('Warning: Could not load .env file:', error.message);
-}
+// Explicit read allowlist: new tools fail closed until classified here.
+const READ_ONLY_TOOLS = new Set([
+  'proxmox_get_nodes', 'proxmox_get_node_status', 'proxmox_get_vms',
+  'proxmox_get_vm_status', 'proxmox_get_storage', 'proxmox_get_cluster_status',
+  'proxmox_list_templates', 'proxmox_get_next_vmid', 'proxmox_generate_terraform',
+  'proxmox_list_snapshots_vm', 'proxmox_list_snapshots_lxc', 'proxmox_list_backups',
+  'proxmox_get_task_status', 'proxmox_get_vm_config', 'proxmox_whoami',
+  'proxmox_get_guest_ips', 'proxmox_get_rrd_data', 'proxmox_get_pools',
+  'proxmox_get_ha_resources', 'proxmox_get_firewall_rules',
+]);
 
 export class ProxmoxServer {
   constructor() {
@@ -70,10 +55,9 @@ export class ProxmoxServer {
     this.proxmoxPort = process.env.PROXMOX_PORT || '8006';
     this.allowElevated = process.env.PROXMOX_ALLOW_ELEVATED === 'true';
 
-    // TLS verification. Proxmox ships with a self-signed certificate, so the
-    // default stays off for out-of-the-box compatibility, but operators with a
-    // proper CA-signed cert can opt into verification with PROXMOX_VERIFY_TLS=true.
-    this.verifyTls = process.env.PROXMOX_VERIFY_TLS === 'true';
+    // Use Node's trust store (including NODE_EXTRA_CA_CERTS). Only the exact
+    // value 'false' opts out; absent or misspelled settings stay secure.
+    this.verifyTls = process.env.PROXMOX_VERIFY_TLS !== 'false';
     this.httpsAgent = new https.Agent({
       rejectUnauthorized: this.verifyTls
     });
@@ -128,7 +112,7 @@ export class ProxmoxServer {
         contents: [{
           uri,
           mimeType: 'application/json',
-          text: JSON.stringify(payload ?? null, null, 2),
+          text: JSON.stringify(this.redactCredentials(payload ?? null), null, 2),
         }],
       };
     });
@@ -425,10 +409,27 @@ export class ProxmoxServer {
     return upid;
   }
 
-  // Build an MCP tool result carrying both human-readable text and a machine
-  // readable structuredContent payload, so agents can chain on the data
-  // instead of regex-parsing prose. Older MCP clients simply ignore the extra
-  // field and render the text.
+  // Redact credentials at response boundaries without dropping guest config fields.
+  redactCredentials(value) {
+    if (typeof value === 'string') {
+      let text = value;
+      // Exact secret and common URL/JSON escaped forms, not broad config keys.
+      const secret = this.proxmoxTokenValue;
+      if (secret) {
+        for (const variant of new Set([secret, encodeURIComponent(secret), JSON.stringify(secret).slice(1, -1)])) {
+          text = text.split(variant).join('[REDACTED]');
+        }
+      }
+      return text.replace(/PVEAPIToken=[^\s"'<>]+/gi, 'PVEAPIToken=[REDACTED]');
+    }
+    if (Array.isArray(value)) return value.map(item => this.redactCredentials(item));
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) =>
+        [this.redactCredentials(key), this.redactCredentials(item)]));
+    }
+    return value;
+  }
+
   respond(text, structured = undefined, isError = false) {
     const result = { content: [{ type: 'text', text }] };
     if (structured !== undefined) {
@@ -437,7 +438,7 @@ export class ProxmoxServer {
     if (isError) {
       result.isError = true;
     }
-    return result;
+    return this.redactCredentials(result);
   }
 
   // Extract a UPID from a mutating-endpoint response. Proxmox returns the UPID
@@ -469,6 +470,9 @@ export class ProxmoxServer {
   }
 
   async proxmoxRequest(endpoint, method = 'GET', body = null) {
+    if (!this.allowElevated && method !== 'GET') {
+      throw new Error('Read-only mode rejects non-GET Proxmox requests');
+    }
     const baseUrl = `https://${this.proxmoxHost}:${this.proxmoxPort}/api2/json`;
     const url = `${baseUrl}${endpoint}`;
 
@@ -554,10 +558,12 @@ export class ProxmoxServer {
       }
 
       const data = JSON.parse(textResponse);
-      return data.data;
+      return this.redactCredentials(data.data);
     } catch (error) {
+      error.message = this.redactCredentials(error.message);
       if (error.name === 'SyntaxError') {
-        throw new Error(`Failed to parse Proxmox API response: ${error.message}`);
+        // JSON.parse messages can quote truncated secret fragments. Do not echo the body.
+        throw new Error('Failed to parse Proxmox API response: invalid JSON');
       }
       const isNetworkError =
         ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', 'ECONNRESET', 'EHOSTUNREACH']
@@ -939,7 +945,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_snapshots_lxc',
-          description: 'List all snapshots of an LXC container (requires elevated permissions)',
+          description: 'List all snapshots of an LXC container (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -951,7 +957,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_snapshots_vm',
-          description: 'List all snapshots of a QEMU virtual machine (requires elevated permissions)',
+          description: 'List all snapshots of a QEMU virtual machine (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1045,7 +1051,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_list_backups',
-          description: 'List all backups on a storage (requires elevated permissions)',
+          description: 'List all backups on a storage (read-only; requires appropriate Proxmox API privileges)',
           inputSchema: {
             type: 'object',
             properties: {
@@ -1374,7 +1380,7 @@ export class ProxmoxServer {
         },
         {
           name: 'proxmox_get_guest_ips',
-          description: "Discover a running VM's real IP addresses via the QEMU guest agent (qemu only; requires elevated permissions and a running guest agent)",
+          description: "Discover a running VM's real IP addresses via the QEMU guest agent (read-only; qemu only; requires appropriate Proxmox API privileges and a running guest agent)",
           inputSchema: {
             type: 'object',
             properties: {
@@ -1460,12 +1466,17 @@ export class ProxmoxServer {
             }
           }
         }
-      ]
+      ].filter(tool => this.allowElevated || READ_ONLY_TOOLS.has(tool.name))
     }));
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name, arguments: args } = request.params;
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) =>
+      this.redactCredentials(await this.callTool(request.params)));
+  }
 
+  async callTool({ name, arguments: args = {} }) {
+      if (!this.allowElevated && !READ_ONLY_TOOLS.has(name)) {
+        return this.requireElevated(name);
+      }
       try {
         switch (name) {
           case 'proxmox_get_nodes':
@@ -1674,6 +1685,7 @@ export class ProxmoxServer {
         }
       } catch (error) {
         return {
+          isError: true,
           content: [
             {
               type: 'text',
@@ -1682,7 +1694,6 @@ export class ProxmoxServer {
           ]
         };
       }
-    });
   }
 
   async getNodes() {
@@ -1720,15 +1731,6 @@ export class ProxmoxServer {
   }
 
   async getNodeStatus(node) {
-    if (!this.allowElevated) {
-      return {
-        content: [{
-          type: 'text',
-          text: `⚠️  **Node Status Requires Elevated Permissions**\n\nTo view detailed node status, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and ensure your API token has Sys.Audit permissions.\n\n**Current permissions**: Basic (node listing only)`
-        }]
-      };
-    }
-
     try {
       // Validate inputs
       const safeNode = this.validateNodeName(node);
@@ -1890,9 +1892,10 @@ export class ProxmoxServer {
   async executeVMCommand(node, vmid, command, type = 'qemu', wait = true) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Command Execution Requires Elevated Permissions**\n\nTo execute commands on VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and ensure your API token has appropriate VM permissions.\n\n**Current permissions**: Basic (VM listing only)\n**Requested command**: \`${command}\``
+          text: `⚠️  **VM Command Execution Requires Elevated Permissions**\n\nTo execute commands on VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment and ensure your API token has appropriate VM permissions.\n\n**Current permissions**: Basic (VM listing only)\n**Requested command**: \`${command}\``
         }]
       };
     }
@@ -1908,6 +1911,7 @@ export class ProxmoxServer {
       // POSTing to a path that does not exist.
       if (safeType !== 'qemu') {
         return {
+          isError: true,
           content: [{
             type: 'text',
             text: `⚠️  **Command execution is not supported for LXC containers**\n\nThe Proxmox API only exposes command execution for QEMU VMs (via the guest agent). There is no equivalent HTTP endpoint for containers.\n\n**Alternatives**: run the command over SSH, or use \`pct exec ${safeVMID} -- <command>\` on the Proxmox host.`
@@ -2067,15 +2071,7 @@ export class ProxmoxServer {
     try {
       const nodes = await this.proxmoxRequest('/nodes');
       
-      // Try to get cluster status, but fall back gracefully if permissions are insufficient
-      let clusterStatus = null;
-      if (this.allowElevated) {
-        try {
-          clusterStatus = await this.proxmoxRequest('/cluster/status');
-        } catch (error) {
-          // Ignore cluster status errors for elevated permissions
-        }
-      }
+      const clusterStatus = await this.proxmoxRequest('/cluster/status');
       
       let output = '🏗️  **Proxmox Cluster Status**\n\n';
       
@@ -2086,8 +2082,8 @@ export class ProxmoxServer {
       output += `**Cluster Health**: ${onlineNodes === totalNodes ? '🟢 Healthy' : '🟡 Warning'}\n`;
       output += `**Nodes**: ${onlineNodes}/${totalNodes} online\n\n`;
       
-      if (this.allowElevated) {
-        // Resource summary (only available with elevated permissions)
+      {
+        // Resource summary uses the same read-only node data.
         let totalCpu = 0, usedCpu = 0;
         let totalMem = 0, usedMem = 0;
         
@@ -2106,8 +2102,6 @@ export class ProxmoxServer {
         output += `**Resource Usage**:\n`;
         output += `• CPU: ${cpuPercent}% (${usedCpu.toFixed(1)}/${totalCpu} cores)\n`;
         output += `• Memory: ${memPercent}% (${this.formatBytes(usedMem)}/${this.formatBytes(totalMem)})\n\n`;
-      } else {
-        output += `⚠️  **Limited Information**: Resource usage requires elevated permissions\n\n`;
       }
       
       // Node status
@@ -2117,11 +2111,10 @@ export class ProxmoxServer {
         output += `${status} ${node.node} - ${node.status}\n`;
       }
       
-      return {
-        content: [{ type: 'text', text: output }]
-      };
+      return this.respond(output, { nodes, clusterStatus });
     } catch (error) {
       return {
+        isError: true,
         content: [{ 
           type: 'text', 
           text: `❌ **Failed to get cluster status**\n\nError: ${error.message}` 
@@ -2159,6 +2152,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to list templates**\n\nError: ${error.message}\n\n**Note**: Make sure the storage exists and contains LXC templates.`
@@ -2170,9 +2164,10 @@ export class ProxmoxServer {
   async createLXCContainer(args) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Container Creation Requires Elevated Permissions**\n\nTo create containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and ensure your API token has VM.Allocate permissions.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Container Creation Requires Elevated Permissions**\n\nTo create containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment and ensure your API token has VM.Allocate permissions.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2224,6 +2219,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to create container**\n\nError: ${error.message}\n\n**Common issues**:\n- VM ID already in use\n- Invalid template path\n- Insufficient permissions\n- Storage doesn't exist`
@@ -2235,9 +2231,10 @@ export class ProxmoxServer {
   async createVM(args) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Creation Requires Elevated Permissions**\n\nTo create VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and ensure your API token has VM.Allocate permissions.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Creation Requires Elevated Permissions**\n\nTo create VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment and ensure your API token has VM.Allocate permissions.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2302,6 +2299,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to create VM**\n\nError: ${error.message}\n\n**Common issues**:\n- VM ID already in use\n- Invalid ISO path\n- Insufficient permissions\n- Storage doesn't exist`
@@ -2313,9 +2311,10 @@ export class ProxmoxServer {
   async startVM(node, vmid, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Control Requires Elevated Permissions**\n\nTo start/stop VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Control Requires Elevated Permissions**\n\nTo start/stop VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2339,6 +2338,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to start VM/Container**\n\nError: ${error.message}`
@@ -2350,9 +2350,10 @@ export class ProxmoxServer {
   async stopVM(node, vmid, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Control Requires Elevated Permissions**\n\nTo start/stop VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Control Requires Elevated Permissions**\n\nTo start/stop VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2376,6 +2377,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to stop VM/Container**\n\nError: ${error.message}`
@@ -2392,6 +2394,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{ type: 'text', text: `❌ **Failed to get next VMID**\n\nError: ${error.message}` }]
       };
     }
@@ -2400,9 +2403,10 @@ export class ProxmoxServer {
   async deleteVM(node, vmid, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM/Container Deletion Requires Elevated Permissions**\n\nTo delete VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM/Container Deletion Requires Elevated Permissions**\n\nTo delete VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2445,6 +2449,7 @@ export class ProxmoxServer {
       });
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to delete VM/Container**\n\nError: ${error.message}\n\n**Note**: Make sure the VM/container is stopped first.`
@@ -2456,9 +2461,10 @@ export class ProxmoxServer {
   async rebootVM(node, vmid, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Reboot Requires Elevated Permissions**\n\nTo reboot VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Reboot Requires Elevated Permissions**\n\nTo reboot VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2482,6 +2488,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to reboot VM/Container**\n\nError: ${error.message}`
@@ -2493,9 +2500,10 @@ export class ProxmoxServer {
   async shutdownVM(node, vmid, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Shutdown Requires Elevated Permissions**\n\nTo shutdown VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Shutdown Requires Elevated Permissions**\n\nTo shutdown VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2519,6 +2527,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to shutdown VM/Container**\n\nError: ${error.message}`
@@ -2530,9 +2539,10 @@ export class ProxmoxServer {
   async pauseVM(node, vmid) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Pause Requires Elevated Permissions**\n\nTo pause VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Pause Requires Elevated Permissions**\n\nTo pause VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2556,6 +2566,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to pause VM**\n\nError: ${error.message}\n\n**Note**: Pause is only available for QEMU VMs, not LXC containers.`
@@ -2567,9 +2578,10 @@ export class ProxmoxServer {
   async resumeVM(node, vmid) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Resume Requires Elevated Permissions**\n\nTo resume VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Resume Requires Elevated Permissions**\n\nTo resume VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2593,6 +2605,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to resume VM**\n\nError: ${error.message}\n\n**Note**: Resume is only available for QEMU VMs, not LXC containers.`
@@ -2604,9 +2617,10 @@ export class ProxmoxServer {
   async cloneVM(node, vmid, newid, nameOrHostname, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Clone Requires Elevated Permissions**\n\nTo clone VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Clone Requires Elevated Permissions**\n\nTo clone VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2644,6 +2658,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to clone VM/Container**\n\nError: ${error.message}\n\n**Common issues**:\n- New VM ID already in use\n- Insufficient storage space\n- Source VM is running (some storage types require stopped VM)`
@@ -2655,9 +2670,10 @@ export class ProxmoxServer {
   async resizeVM(node, vmid, memory, cores, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **VM Resize Requires Elevated Permissions**\n\nTo resize VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **VM Resize Requires Elevated Permissions**\n\nTo resize VMs/containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2673,6 +2689,7 @@ export class ProxmoxServer {
 
     if (Object.keys(body).length === 0) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `⚠️  **No Resize Parameters Provided**\n\nPlease specify at least one parameter:\n- \`memory\`: Memory in MB\n- \`cores\`: Number of CPU cores`
@@ -2705,6 +2722,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to resize VM/Container**\n\nError: ${error.message}\n\n**Common issues**:\n- Memory/CPU values exceed node capacity\n- VM is locked or in use\n- Invalid parameter values`
@@ -2716,9 +2734,10 @@ export class ProxmoxServer {
   async createSnapshot(node, vmid, snapname, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Snapshot Creation Requires Elevated Permissions**\n\nTo create snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Snapshot Creation Requires Elevated Permissions**\n\nTo create snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2746,6 +2765,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to create snapshot**\n\nError: ${error.message}\n\n**Common issues**:\n- Snapshot name already exists\n- Insufficient disk space\n- VM is locked or in use`
@@ -2755,15 +2775,6 @@ export class ProxmoxServer {
   }
 
   async listSnapshots(node, vmid, type = 'lxc') {
-    if (!this.allowElevated) {
-      return {
-        content: [{
-          type: 'text',
-          text: `⚠️  **Snapshot Listing Requires Elevated Permissions**\n\nTo list snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
-        }]
-      };
-    }
-
     try {
       // Validate inputs
       const safeNode = this.validateNodeName(node);
@@ -2804,6 +2815,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to list snapshots**\n\nError: ${error.message}`
@@ -2815,9 +2827,10 @@ export class ProxmoxServer {
   async rollbackSnapshot(node, vmid, snapname, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Snapshot Rollback Requires Elevated Permissions**\n\nTo rollback snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Snapshot Rollback Requires Elevated Permissions**\n\nTo rollback snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2844,6 +2857,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to rollback snapshot**\n\nError: ${error.message}\n\n**Common issues**:\n- Snapshot doesn't exist\n- VM is running (stop it first)\n- VM is locked or in use`
@@ -2855,9 +2869,10 @@ export class ProxmoxServer {
   async deleteSnapshot(node, vmid, snapname, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Snapshot Deletion Requires Elevated Permissions**\n\nTo delete snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Snapshot Deletion Requires Elevated Permissions**\n\nTo delete snapshots, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2883,6 +2898,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to delete snapshot**\n\nError: ${error.message}\n\n**Common issues**:\n- Snapshot doesn't exist\n- VM is locked or in use\n- Insufficient permissions`
@@ -2894,9 +2910,10 @@ export class ProxmoxServer {
   async createBackup(node, vmid, storage = 'local', mode = 'snapshot', compress = 'zstd', type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Backup Creation Requires Elevated Permissions**\n\nTo create backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Backup Creation Requires Elevated Permissions**\n\nTo create backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -2933,6 +2950,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to create backup**\n\nError: ${error.message}\n\n**Common issues**:\n- Insufficient disk space on storage\n- VM is locked or in use\n- Invalid storage name\n- Insufficient permissions`
@@ -2942,15 +2960,6 @@ export class ProxmoxServer {
   }
 
   async listBackups(node, storage = 'local') {
-    if (!this.allowElevated) {
-      return {
-        content: [{
-          type: 'text',
-          text: `⚠️  **Backup Listing Requires Elevated Permissions**\n\nTo list backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
-        }]
-      };
-    }
-
     try {
       // Validate inputs
       const safeNode = this.validateNodeName(node);
@@ -2992,6 +3001,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to list backups**\n\nError: ${error.message}\n\n**Common issues**:\n- Storage doesn't exist\n- Storage is not accessible\n- Insufficient permissions`
@@ -3003,9 +3013,10 @@ export class ProxmoxServer {
   async restoreBackup(node, vmid, archive, storage, type = 'lxc') {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Backup Restore Requires Elevated Permissions**\n\nTo restore backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Backup Restore Requires Elevated Permissions**\n\nTo restore backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3051,6 +3062,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to restore backup**\n\nError: ${error.message}\n\n**Common issues**:\n- VM ID already in use\n- Backup archive doesn't exist\n- Insufficient storage space\n- Invalid archive path\n- Insufficient permissions`
@@ -3062,9 +3074,10 @@ export class ProxmoxServer {
   async deleteBackup(node, storage, volume) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Backup Deletion Requires Elevated Permissions**\n\nTo delete backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Backup Deletion Requires Elevated Permissions**\n\nTo delete backups, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3089,6 +3102,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to delete backup**\n\nError: ${error.message}\n\n**Common issues**:\n- Backup doesn't exist\n- Invalid volume path\n- Backup is in use\n- Insufficient permissions`
@@ -3100,9 +3114,10 @@ export class ProxmoxServer {
   async addDiskVM(node, vmid, disk, storage, size) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo add disks to VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo add disks to VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3141,6 +3156,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to add disk to VM**\n\nError: ${error.message}\n\n**Common issues**:\n- Disk name already in use\n- VM is running (may need to be stopped)\n- Invalid disk name format\n- Insufficient storage space\n- Storage doesn't exist`
@@ -3152,9 +3168,10 @@ export class ProxmoxServer {
   async addMountPointLXC(node, vmid, mp, storage, size) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo add mount points to containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo add mount points to containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3187,6 +3204,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to add mount point to container**\n\nError: ${error.message}\n\n**Common issues**:\n- Mount point name already in use\n- Container is running (may need to be stopped)\n- Invalid mount point name\n- Insufficient storage space\n- Storage doesn't exist`
@@ -3198,9 +3216,10 @@ export class ProxmoxServer {
   async resizeDiskVM(node, vmid, disk, size) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo resize VM disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo resize VM disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3234,6 +3253,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to resize VM disk**\n\nError: ${error.message}\n\n**Common issues**:\n- Disk doesn't exist\n- Trying to shrink disk (not supported)\n- Insufficient storage space\n- Invalid size format\n- VM is locked or in use`
@@ -3245,9 +3265,10 @@ export class ProxmoxServer {
   async resizeDiskLXC(node, vmid, disk, size) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo resize LXC disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo resize LXC disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3282,6 +3303,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to resize LXC disk**\n\nError: ${error.message}\n\n**Common issues**:\n- Disk doesn't exist\n- Trying to shrink disk (not supported)\n- Insufficient storage space\n- Invalid size format\n- Container is locked or in use`
@@ -3293,9 +3315,10 @@ export class ProxmoxServer {
   async removeDiskVM(node, vmid, disk) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo remove disks from VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo remove disks from VMs, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3325,6 +3348,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to remove disk from VM**\n\nError: ${error.message}\n\n**Common issues**:\n- Disk doesn't exist\n- VM is running (must be stopped)\n- Cannot remove boot disk\n- VM is locked or in use`
@@ -3336,9 +3360,10 @@ export class ProxmoxServer {
   async removeMountPointLXC(node, vmid, mp) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo remove mount points from containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo remove mount points from containers, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3368,6 +3393,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to remove mount point from container**\n\nError: ${error.message}\n\n**Common issues**:\n- Mount point doesn't exist\n- Container is running (must be stopped)\n- Cannot remove rootfs\n- Container is locked or in use`
@@ -3379,9 +3405,10 @@ export class ProxmoxServer {
   async moveDiskVM(node, vmid, disk, storage, deleteSource = true) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo move VM disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo move VM disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3416,6 +3443,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to move VM disk**\n\nError: ${error.message}\n\n**Common issues**:\n- Disk doesn't exist\n- Target storage doesn't exist\n- Insufficient space on target storage\n- VM is running (may need to be stopped)\n- VM is locked or in use`
@@ -3427,9 +3455,10 @@ export class ProxmoxServer {
   async moveDiskLXC(node, vmid, disk, storage, deleteSource = true) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo move LXC disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Disk Management Requires Elevated Permissions**\n\nTo move LXC disks, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3465,6 +3494,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to move LXC volume**\n\nError: ${error.message}\n\n**Common issues**:\n- Volume doesn't exist\n- Target storage doesn't exist\n- Insufficient space on target storage\n- Container is running (may need to be stopped)\n- Container is locked or in use`
@@ -3476,9 +3506,10 @@ export class ProxmoxServer {
   async addNetworkVM(node, vmid, net, bridge, model = 'virtio', macaddr, vlan, firewall) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo add VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo add VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3530,6 +3561,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to add VM network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface already exists\n- Bridge doesn't exist\n- Invalid MAC address format\n- Invalid VLAN tag (must be 1-4094)\n- VM is locked or in use`
@@ -3541,9 +3573,10 @@ export class ProxmoxServer {
   async addNetworkLXC(node, vmid, net, bridge, ip, gw, firewall) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo add LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo add LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3597,6 +3630,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to add LXC network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface already exists\n- Bridge doesn't exist\n- Invalid IP address format\n- Invalid gateway address\n- Container is locked or in use`
@@ -3608,9 +3642,10 @@ export class ProxmoxServer {
   async updateNetworkVM(node, vmid, net, bridge, model, macaddr, vlan, firewall) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo update VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo update VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3626,6 +3661,7 @@ export class ProxmoxServer {
 
       if (!config[safeNet]) {
         return {
+          isError: true,
           content: [{
             type: 'text',
             text: `❌ **Network interface ${safeNet} does not exist**\n\nPlease add the interface first using proxmox_add_network_vm.\n\n**Existing interfaces**: ${Object.keys(config).filter(k => k.startsWith('net')).join(', ') || 'None'}`
@@ -3706,6 +3742,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to update VM network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface doesn't exist\n- Bridge doesn't exist\n- Invalid MAC address format\n- Invalid VLAN tag (must be 1-4094)\n- VM is locked or in use`
@@ -3717,9 +3754,10 @@ export class ProxmoxServer {
   async updateNetworkLXC(node, vmid, net, bridge, ip, gw, firewall) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo update LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo update LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3736,6 +3774,7 @@ export class ProxmoxServer {
 
       if (!config[safeNet]) {
         return {
+          isError: true,
           content: [{
             type: 'text',
             text: `❌ **Network interface ${safeNet} does not exist**\n\nPlease add the interface first using proxmox_add_network_lxc.\n\n**Existing interfaces**: ${Object.keys(config).filter(k => k.startsWith('net')).join(', ') || 'None'}`
@@ -3799,6 +3838,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to update LXC network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface doesn't exist\n- Bridge doesn't exist\n- Invalid IP address format\n- Invalid gateway address\n- Container is locked or in use`
@@ -3810,9 +3850,10 @@ export class ProxmoxServer {
   async removeNetworkVM(node, vmid, net) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo remove VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo remove VM network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3841,6 +3882,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to remove VM network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface doesn't exist\n- VM is locked or in use\n- Invalid interface name`
@@ -3852,9 +3894,10 @@ export class ProxmoxServer {
   async removeNetworkLXC(node, vmid, net) {
     if (!this.allowElevated) {
       return {
+        isError: true,
         content: [{
           type: 'text',
-          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo remove LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file.\n\n**Current permissions**: Basic (read-only)`
+          text: `⚠️  **Network Management Requires Elevated Permissions**\n\nTo remove LXC network interfaces, set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment.\n\n**Current permissions**: Basic (read-only)`
         }]
       };
     }
@@ -3883,6 +3926,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to remove LXC network interface**\n\nError: ${error.message}\n\n**Common issues**:\n- Network interface doesn't exist\n- Container is locked or in use\n- Invalid interface name`
@@ -4332,6 +4376,7 @@ export class ProxmoxServer {
       const selected = safeVMID ? targets.filter(t => t.vmid === safeVMID) : targets;
       if (selected.length === 0) {
         return {
+          isError: !!safeVMID,
           content: [{
             type: 'text',
             text: safeVMID
@@ -4365,6 +4410,7 @@ export class ProxmoxServer {
       };
     } catch (error) {
       return {
+        isError: true,
         content: [{
           type: 'text',
           text: `❌ **Failed to generate Terraform configuration**\n\nError: ${error.message}`
@@ -4380,7 +4426,7 @@ export class ProxmoxServer {
     }
     return this.respond(
       `⚠️  **${actionLabel} Requires Elevated Permissions**\n\n` +
-      `Set \`PROXMOX_ALLOW_ELEVATED=true\` in your .env file and make sure the API token has the ` +
+      `Set \`PROXMOX_ALLOW_ELEVATED=true\` in your environment and make sure the API token has the ` +
       `required privileges. Run \`proxmox_whoami\` to see exactly what this token can do.`,
       { error: 'elevated_permissions_required', action: actionLabel, allowElevated: false },
       true
@@ -4583,9 +4629,6 @@ export class ProxmoxServer {
   }
 
   async getGuestIPs(node, vmid) {
-    const guard = this.requireElevated('Guest IP discovery');
-    if (guard) return guard;
-
     try {
       const safeNode = this.validateNodeName(node);
       const safeVMID = this.validateVMID(vmid);
